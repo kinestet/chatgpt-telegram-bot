@@ -1,17 +1,11 @@
 import logging
 import os
 
-from dotenv import load_dotenv
-
 from plugin_manager import PluginManager
 from openai_helper import OpenAIHelper, default_max_tokens, are_functions_available
 from telegram_bot import ChatGPTTelegramBot
 
-
 def main():
-    # Read .env file
-    load_dotenv()
-
     # Setup logging
     logging.basicConfig(
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -23,7 +17,7 @@ def main():
     required_values = ['TELEGRAM_BOT_TOKEN', 'OPENAI_API_KEY']
     missing_values = [value for value in required_values if os.environ.get(value) is None]
     if len(missing_values) > 0:
-        logging.error(f'The following environment values are missing in your .env: {", ".join(missing_values)}')
+        logging.error(f'The following environment values are missing: {", ".join(missing_values)}')
         exit(1)
 
     # Setup configurations
@@ -64,7 +58,7 @@ def main():
 
     if openai_config['enable_functions'] and not functions_available:
         logging.error(f'ENABLE_FUNCTIONS is set to true, but the model {model} does not support it. '
-                        'Please set ENABLE_FUNCTIONS to false or use a model that supports it.')
+                      'Please set ENABLE_FUNCTIONS to false or use a model that supports it.')
         exit(1)
     if os.environ.get('MONTHLY_USER_BUDGETS') is not None:
         logging.warning('The environment variable MONTHLY_USER_BUDGETS is deprecated. '
