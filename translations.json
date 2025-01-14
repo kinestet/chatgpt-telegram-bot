@@ -783,7 +783,6 @@
         "loading":"Завантаження...",
         "function_unavailable_in_inline_mode": "Ця функція недоступна в режимі Inline"
     }
-    //,
     // "uz": {
     //     "help_description": "Yordam xabarini ko'rsatish",
     //     "reset_description": "Suhbatni qayta boshlang. Agar xohlasangiz, umumiy ko'rsatmalar bering (masalan, /reset siz foydali yordamchisiz)",
