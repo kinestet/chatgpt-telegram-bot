@@ -548,7 +548,6 @@ class ChatGPTTelegramBot:
                 return
             
             # convert jpg from telegram to png as understood by openai
-
             temp_file_png = io.BytesIO()
 
             try:
@@ -557,7 +556,6 @@ class ChatGPTTelegramBot:
                 original_image.save(temp_file_png, format='PNG')
                 logging.info(f'New vision request received from user {update.message.from_user.name} '
                              f'(id: {update.message.from_user.id})')
-
             except Exception as e:
                 logging.exception(e)
                 await update.effective_message.reply_text(
@@ -565,15 +563,13 @@ class ChatGPTTelegramBot:
                     reply_to_message_id=get_reply_to_message_id(self.config, update),
                     text=localized_text('media_type_fail', bot_language)
                 )
+                return
             
-            
-
             user_id = update.message.from_user.id
             if user_id not in self.usage:
                 self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
 
             if self.config['stream']:
-
                 stream_response = self.openai.interpret_image_stream(chat_id=chat_id, fileobj=temp_file_png, prompt=prompt)
                 i = 0
                 prev = ''
@@ -618,15 +614,5 @@ class ChatGPTTelegramBot:
                             sent_message = await update.effective_message.reply_text(
                                 message_thread_id=get_thread_id(update),
                                 reply_to_message_id=get_reply_to_message_id(self.config, update),
-                                text=content,
+                                text=content
                             )
-                        except:
-                            continue
-
-                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
-                        prev = content
-
-                        try:
-                            use_markdown = tokens != 'not_finished'
-                            await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                          text=content, markdown=use_markdown
