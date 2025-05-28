@@ -1,14 +1,19 @@
-FROM python:3.9-alpine
-
-ENV PYTHONFAULTHANDLER=1 \
-     PYTHONUNBUFFERED=1 \
-     PYTHONDONTWRITEBYTECODE=1 \
-     PIP_DISABLE_PIP_VERSION_CHECK=on
-
-RUN apk --no-cache add ffmpeg
+FROM python:3.11-slim
 
 WORKDIR /app
-COPY . .
-RUN pip install -r requirements.txt --no-cache-dir
 
-CMD ["python", "bot/main.py"]
+# Установка системных зависимостей
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копирование файлов проекта
+COPY requirements.txt .
+COPY bot/ ./bot/
+COPY translations.json .
+
+# Установка Python зависимостей
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Запуск бота
+CMD ["python", "-m", "bot.main"]
