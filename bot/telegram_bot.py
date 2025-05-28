@@ -1045,11 +1045,11 @@ class ChatGPTTelegramBot:
 
         # Schedule periodic broadcast job
         if hasattr(application, "job_queue"):
-            from datetime import datetime, timedelta
+            from datetime import datetime, time, timedelta
             import pytz
 
             async def periodic_broadcast(context: ContextTypes.DEFAULT_TYPE):
-                from datetime import datetime, timedelta
+                from datetime import datetime, time, timedelta
                 import pytz
 
                 now = datetime.now(pytz.UTC)
@@ -1071,7 +1071,7 @@ class ChatGPTTelegramBot:
                         logging.exception(f"Failed to send scheduled message to {user_id}: {e}")
 
             # Run every day at 10:00 UTC
-            application.job_queue.run_daily(periodic_broadcast, time=datetime.time(hour=10, tzinfo=pytz.UTC))
+            application.job_queue.run_daily(periodic_broadcast, time=time(hour=10, tzinfo=pytz.UTC))
 
     def run(self):
         """
