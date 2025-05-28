@@ -26,7 +26,7 @@ def main():
     max_tokens_default = default_max_tokens(model=model)
     openai_config = {
         'api_key': os.environ['OPENAI_API_KEY'],
-        'show_usage': os.environ.get('SHOW_USAGE', 'true').lower() == 'true',
+        'show_usage': os.environ.get('SHOW_USAGE', 'false').lower() == 'true',
         'stream': os.environ.get('STREAM', 'true').lower() == 'true',
         'proxy': os.environ.get('PROXY', None) or os.environ.get('OPENAI_PROXY', None),
         'max_history_size': int(os.environ.get('MAX_HISTORY_SIZE', 150)),
@@ -94,6 +94,8 @@ def main():
         'tts_prices': [float(i) for i in os.environ.get('TTS_PRICES', "0.015,0.030").split(",")],
         'transcription_price': float(os.environ.get('TRANSCRIPTION_PRICE', 0.006)),
         'bot_language': os.environ.get('BOT_LANGUAGE', 'en'),
+        'feedback_interval_days': int(os.environ.get('FEEDBACK_INTERVAL_DAYS', 0)),
+        'broadcast_hour': int(os.environ.get('BROADCAST_HOUR', 14)),
     }
 
     plugin_config = {

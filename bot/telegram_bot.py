@@ -1052,13 +1052,16 @@ class ChatGPTTelegramBot:
                 from datetime import datetime, time, timedelta
                 import pytz
 
+                # Get the feedback interval from config, default to 7 days if not specified
+                feedback_interval_days = self.config.get('feedback_interval_days', 7)
+                
                 now = datetime.now(pytz.UTC)
                 for user_id, tracker in self.usage.items():
                     try:
                         last = tracker.get_last_initiated_message()
                         if last is not None:
                             last_dt = datetime.fromisoformat(last)
-                            if (now - last_dt).days < 7:
+                            if (now - last_dt).days < feedback_interval_days:
                                 continue
                         # Try to send message
                         await context.bot.send_message(
@@ -1070,8 +1073,11 @@ class ChatGPTTelegramBot:
                         import logging
                         logging.exception(f"Failed to send scheduled message to {user_id}: {e}")
 
-            # Run every day at 10:00 UTC
-            application.job_queue.run_daily(periodic_broadcast, time=time(hour=10, tzinfo=pytz.UTC))
+            # Get broadcast time from config, default to 10:00 UTC if not specified
+            broadcast_hour = self.config.get('broadcast_hour', 10)
+            
+            # Run every day at the configured hour UTC
+            application.job_queue.run_daily(periodic_broadcast, time=time(hour=broadcast_hour, tzinfo=pytz.UTC))
 
     def run(self):
         """
