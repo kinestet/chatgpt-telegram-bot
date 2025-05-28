@@ -20,7 +20,7 @@ from utils import is_group_chat, get_thread_id, message_text, wrap_with_indicato
     edit_message_with_retry, get_stream_cutoff_values, is_allowed, get_remaining_budget, is_admin, is_within_budget, \
     get_reply_to_message_id, add_chat_request_to_usage_tracker, error_handler, is_direct_result, handle_direct_result, \
     cleanup_intermediate_files
-from openai_helper import OpenAIHelper, localized_text
+from openai_helper import OpenAIHelper, localized_text, GPT_ALL_MODELS
 from usage_tracker import UsageTracker
 
 
@@ -42,7 +42,8 @@ class ChatGPTTelegramBot:
             BotCommand(command='help', description=localized_text('help_description', bot_language)),
             BotCommand(command='reset', description=localized_text('reset_description', bot_language)),
             BotCommand(command='stats', description=localized_text('stats_description', bot_language)),
-            BotCommand(command='resend', description=localized_text('resend_description', bot_language))
+            BotCommand(command='resend', description=localized_text('resend_description', bot_language)),
+            BotCommand(command='model', description='Change the OpenAI model')
         ]
         # If imaging is enabled, add the "image" command to the list
         if self.config.get('enable_image_generation', False):
@@ -231,6 +232,59 @@ class ChatGPTTelegramBot:
         await update.effective_message.reply_text(
             message_thread_id=get_thread_id(update),
             text=localized_text('reset_done', self.config['bot_language'])
+        )
+
+    async def model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Changes the OpenAI model
+        """
+        if not await is_allowed(self.config, update, context):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                            'is not allowed to change the model')
+            await self.send_disallowed_message(update, context)
+            return
+
+        if not is_admin(self.config, update.message.from_user.id):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                            'is not an admin and cannot change the model')
+            await update.effective_message.reply_text(
+                message_thread_id=get_thread_id(update),
+                text="Only admins can change the model."
+            )
+            return
+
+        model_name = message_text(update.message).strip()
+        if not model_name:
+            # Show current model and available models
+            current_model = self.config['model']
+            available_models = "\n".join([f"- {model}" for model in GPT_ALL_MODELS])
+            await update.effective_message.reply_text(
+                message_thread_id=get_thread_id(update),
+                text=f"Current model: {current_model}\n\nAvailable models:\n{available_models}\n\nTo change model, use: /model model_name"
+            )
+            return
+
+        if model_name not in GPT_ALL_MODELS:
+            await update.effective_message.reply_text(
+                message_thread_id=get_thread_id(update),
+                text=f"Model '{model_name}' is not available. Use /model to see available models."
+            )
+            return
+
+        # Update the model in the config
+        self.config['model'] = model_name
+        self.openai.config['model'] = model_name
+        
+        # Reset all chat histories to avoid potential issues with different models
+        for chat_id in list(self.openai.conversations.keys()):
+            self.openai.reset_chat_history(chat_id)
+            
+        logging.info(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                     f'changed the model to {model_name}')
+        
+        await update.effective_message.reply_text(
+            message_thread_id=get_thread_id(update),
+            text=f"Model changed to {model_name}. All conversations have been reset."
         )
 
     async def image(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -575,545 +629,4 @@ class ChatGPTTelegramBot:
                         try:
                             use_markdown = tokens != 'not_finished'
                             await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                          text=content, markdown=use_markdown)
-
-                        except RetryAfter as e:
-                            backoff += 5
-                            await asyncio.sleep(e.retry_after)
-                            continue
-
-                        except TimedOut:
-                            backoff += 5
-                            await asyncio.sleep(0.5)
-                            continue
-
-                        except Exception:
-                            backoff += 5
-                            continue
-
-                        await asyncio.sleep(0.01)
-
-                    i += 1
-                    if tokens != 'not_finished':
-                        total_tokens = int(tokens)
-
-                
-            else:
-
-                try:
-                    interpretation, total_tokens = await self.openai.interpret_image(chat_id, temp_file_png, prompt=prompt)
-
-
-                    try:
-                        await update.effective_message.reply_text(
-                            message_thread_id=get_thread_id(update),
-                            reply_to_message_id=get_reply_to_message_id(self.config, update),
-                            text=interpretation,
-                            parse_mode=constants.ParseMode.MARKDOWN
-                        )
-                    except BadRequest:
-                        try:
-                            await update.effective_message.reply_text(
-                                message_thread_id=get_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                                text=interpretation
-                            )
-                        except Exception as e:
-                            logging.exception(e)
-                            await update.effective_message.reply_text(
-                                message_thread_id=get_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                                text=f"{localized_text('vision_fail', bot_language)}: {str(e)}",
-                                parse_mode=constants.ParseMode.MARKDOWN
-                            )
-                except Exception as e:
-                    logging.exception(e)
-                    await update.effective_message.reply_text(
-                        message_thread_id=get_thread_id(update),
-                        reply_to_message_id=get_reply_to_message_id(self.config, update),
-                        text=f"{localized_text('vision_fail', bot_language)}: {str(e)}",
-                        parse_mode=constants.ParseMode.MARKDOWN
-                    )
-            vision_token_price = self.config['vision_token_price']
-            self.usage[user_id].add_vision_tokens(total_tokens, vision_token_price)
-
-            allowed_user_ids = self.config['allowed_user_ids'].split(',')
-            if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
-                self.usage["guests"].add_vision_tokens(total_tokens, vision_token_price)
-
-        await wrap_with_indicator(update, context, _execute, constants.ChatAction.TYPING)
-
-    async def prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        React to incoming messages and respond accordingly.
-        """
-        if update.edited_message or not update.message or update.message.via_bot:
-            return
-
-        if not await self.check_allowed_and_within_budget(update, context):
-            return
-
-        logging.info(
-            f'New message received from user {update.message.from_user.name} (id: {update.message.from_user.id})')
-        chat_id = update.effective_chat.id
-        user_id = update.message.from_user.id
-        prompt = message_text(update.message)
-        self.last_message[chat_id] = prompt
-
-        if is_group_chat(update):
-            trigger_keyword = self.config['group_trigger_keyword']
-
-            if prompt.lower().startswith(trigger_keyword.lower()) or update.message.text.lower().startswith('/chat'):
-                if prompt.lower().startswith(trigger_keyword.lower()):
-                    prompt = prompt[len(trigger_keyword):].strip()
-
-                if update.message.reply_to_message and \
-                        update.message.reply_to_message.text and \
-                        update.message.reply_to_message.from_user.id != context.bot.id:
-                    prompt = f'"{update.message.reply_to_message.text}" {prompt}'
-            else:
-                if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
-                    logging.info('Message is a reply to the bot, allowing...')
-                else:
-                    logging.warning('Message does not start with trigger keyword, ignoring...')
-                    return
-
-        try:
-            total_tokens = 0
-
-            if self.config['stream']:
-                await update.effective_message.reply_chat_action(
-                    action=constants.ChatAction.TYPING,
-                    message_thread_id=get_thread_id(update)
-                )
-
-                stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
-                i = 0
-                prev = ''
-                sent_message = None
-                backoff = 0
-                stream_chunk = 0
-
-                async for content, tokens in stream_response:
-                    if is_direct_result(content):
-                        return await handle_direct_result(self.config, update, content)
-
-                    if len(content.strip()) == 0:
-                        continue
-
-                    stream_chunks = split_into_chunks(content)
-                    if len(stream_chunks) > 1:
-                        content = stream_chunks[-1]
-                        if stream_chunk != len(stream_chunks) - 1:
-                            stream_chunk += 1
-                            try:
-                                await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                              stream_chunks[-2])
-                            except:
-                                pass
-                            try:
-                                sent_message = await update.effective_message.reply_text(
-                                    message_thread_id=get_thread_id(update),
-                                    text=content if len(content) > 0 else "..."
-                                )
-                            except:
-                                pass
-                            continue
-
-                    cutoff = get_stream_cutoff_values(update, content)
-                    cutoff += backoff
-
-                    if i == 0:
-                        try:
-                            if sent_message is not None:
-                                await context.bot.delete_message(chat_id=sent_message.chat_id,
-                                                                 message_id=sent_message.message_id)
-                            sent_message = await update.effective_message.reply_text(
-                                message_thread_id=get_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                                text=content,
-                            )
-                        except:
-                            continue
-
-                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
-                        prev = content
-
-                        try:
-                            use_markdown = tokens != 'not_finished'
-                            await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                          text=content, markdown=use_markdown)
-
-                        except RetryAfter as e:
-                            backoff += 5
-                            await asyncio.sleep(e.retry_after)
-                            continue
-
-                        except TimedOut:
-                            backoff += 5
-                            await asyncio.sleep(0.5)
-                            continue
-
-                        except Exception:
-                            backoff += 5
-                            continue
-
-                        await asyncio.sleep(0.01)
-
-                    i += 1
-                    if tokens != 'not_finished':
-                        total_tokens = int(tokens)
-
-            else:
-                async def _reply():
-                    nonlocal total_tokens
-                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
-
-                    if is_direct_result(response):
-                        return await handle_direct_result(self.config, update, response)
-
-                    # Split into chunks of 4096 characters (Telegram's message limit)
-                    chunks = split_into_chunks(response)
-
-                    for index, chunk in enumerate(chunks):
-                        try:
-                            await update.effective_message.reply_text(
-                                message_thread_id=get_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config,
-                                                                            update) if index == 0 else None,
-                                text=chunk,
-                                parse_mode=constants.ParseMode.MARKDOWN
-                            )
-                        except Exception:
-                            try:
-                                await update.effective_message.reply_text(
-                                    message_thread_id=get_thread_id(update),
-                                    reply_to_message_id=get_reply_to_message_id(self.config,
-                                                                                update) if index == 0 else None,
-                                    text=chunk
-                                )
-                            except Exception as exception:
-                                raise exception
-
-                await wrap_with_indicator(update, context, _reply, constants.ChatAction.TYPING)
-
-            add_chat_request_to_usage_tracker(self.usage, self.config, user_id, total_tokens)
-
-        except Exception as e:
-            logging.exception(e)
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                text=f"{localized_text('chat_fail', self.config['bot_language'])} {str(e)}",
-                parse_mode=constants.ParseMode.MARKDOWN
-            )
-
-    async def inline_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """
-        Handle the inline query. This is run when you type: @botusername <query>
-        """
-        query = update.inline_query.query
-        if len(query) < 3:
-            return
-        if not await self.check_allowed_and_within_budget(update, context, is_inline=True):
-            return
-
-        callback_data_suffix = "gpt:"
-        result_id = str(uuid4())
-        self.inline_queries_cache[result_id] = query
-        callback_data = f'{callback_data_suffix}{result_id}'
-
-        await self.send_inline_query_result(update, result_id, message_content=query, callback_data=callback_data)
-
-    async def send_inline_query_result(self, update: Update, result_id, message_content, callback_data=""):
-        """
-        Send inline query result
-        """
-        try:
-            reply_markup = None
-            bot_language = self.config['bot_language']
-            if callback_data:
-                reply_markup = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(text=f'🤖 {localized_text("answer_with_chatgpt", bot_language)}',
-                                         callback_data=callback_data)
-                ]])
-
-            inline_query_result = InlineQueryResultArticle(
-                id=result_id,
-                title=localized_text("ask_chatgpt", bot_language),
-                input_message_content=InputTextMessageContent(message_content),
-                description=message_content,
-                thumbnail_url='https://user-images.githubusercontent.com/11541888/223106202-7576ff11-2c8e-408d-94ea-b02a7a32149a.png',
-                reply_markup=reply_markup
-            )
-
-            await update.inline_query.answer([inline_query_result], cache_time=0)
-        except Exception as e:
-            logging.error(f'An error occurred while generating the result card for inline query {e}')
-
-    async def handle_callback_inline_query(self, update: Update, context: CallbackContext):
-        """
-        Handle the callback query from the inline query result
-        """
-        callback_data = update.callback_query.data
-        user_id = update.callback_query.from_user.id
-        inline_message_id = update.callback_query.inline_message_id
-        name = update.callback_query.from_user.name
-        callback_data_suffix = "gpt:"
-        query = ""
-        bot_language = self.config['bot_language']
-        answer_tr = localized_text("answer", bot_language)
-        loading_tr = localized_text("loading", bot_language)
-
-        try:
-            if callback_data.startswith(callback_data_suffix):
-                unique_id = callback_data.split(':')[1]
-                total_tokens = 0
-
-                # Retrieve the prompt from the cache
-                query = self.inline_queries_cache.get(unique_id)
-                if query:
-                    self.inline_queries_cache.pop(unique_id)
-                else:
-                    error_message = (
-                        f'{localized_text("error", bot_language)}. '
-                        f'{localized_text("try_again", bot_language)}'
-                    )
-                    await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
-                                                  text=f'{query}\n\n_{answer_tr}:_\n{error_message}',
-                                                  is_inline=True)
-                    return
-
-                unavailable_message = localized_text("function_unavailable_in_inline_mode", bot_language)
-                if self.config['stream']:
-                    stream_response = self.openai.get_chat_response_stream(chat_id=user_id, query=query)
-                    i = 0
-                    prev = ''
-                    backoff = 0
-                    async for content, tokens in stream_response:
-                        if is_direct_result(content):
-                            cleanup_intermediate_files(content)
-                            await edit_message_with_retry(context, chat_id=None,
-                                                          message_id=inline_message_id,
-                                                          text=f'{query}\n\n_{answer_tr}:_\n{unavailable_message}',
-                                                          is_inline=True)
-                            return
-
-                        if len(content.strip()) == 0:
-                            continue
-
-                        cutoff = get_stream_cutoff_values(update, content)
-                        cutoff += backoff
-
-                        if i == 0:
-                            try:
-                                await edit_message_with_retry(context, chat_id=None,
-                                                              message_id=inline_message_id,
-                                                              text=f'{query}\n\n{answer_tr}:\n{content}',
-                                                              is_inline=True)
-                            except:
-                                continue
-
-                        elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
-                            prev = content
-                            try:
-                                use_markdown = tokens != 'not_finished'
-                                divider = '_' if use_markdown else ''
-                                text = f'{query}\n\n{divider}{answer_tr}:{divider}\n{content}'
-
-                                # We only want to send the first 4096 characters. No chunking allowed in inline mode.
-                                text = text[:4096]
-
-                                await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
-                                                              text=text, markdown=use_markdown, is_inline=True)
-
-                            except RetryAfter as e:
-                                backoff += 5
-                                await asyncio.sleep(e.retry_after)
-                                continue
-                            except TimedOut:
-                                backoff += 5
-                                await asyncio.sleep(0.5)
-                                continue
-                            except Exception:
-                                backoff += 5
-                                continue
-
-                            await asyncio.sleep(0.01)
-
-                        i += 1
-                        if tokens != 'not_finished':
-                            total_tokens = int(tokens)
-
-                else:
-                    async def _send_inline_query_response():
-                        nonlocal total_tokens
-                        # Edit the current message to indicate that the answer is being processed
-                        await context.bot.edit_message_text(inline_message_id=inline_message_id,
-                                                            text=f'{query}\n\n_{answer_tr}:_\n{loading_tr}',
-                                                            parse_mode=constants.ParseMode.MARKDOWN)
-
-                        logging.info(f'Generating response for inline query by {name}')
-                        response, total_tokens = await self.openai.get_chat_response(chat_id=user_id, query=query)
-
-                        if is_direct_result(response):
-                            cleanup_intermediate_files(response)
-                            await edit_message_with_retry(context, chat_id=None,
-                                                          message_id=inline_message_id,
-                                                          text=f'{query}\n\n_{answer_tr}:_\n{unavailable_message}',
-                                                          is_inline=True)
-                            return
-
-                        text_content = f'{query}\n\n_{answer_tr}:_\n{response}'
-
-                        # We only want to send the first 4096 characters. No chunking allowed in inline mode.
-                        text_content = text_content[:4096]
-
-                        # Edit the original message with the generated content
-                        await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
-                                                      text=text_content, is_inline=True)
-
-                    await wrap_with_indicator(update, context, _send_inline_query_response,
-                                              constants.ChatAction.TYPING, is_inline=True)
-
-                add_chat_request_to_usage_tracker(self.usage, self.config, user_id, total_tokens)
-
-        except Exception as e:
-            logging.error(f'Failed to respond to an inline query via button callback: {e}')
-            logging.exception(e)
-            localized_answer = localized_text('chat_fail', self.config['bot_language'])
-            await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
-                                          text=f"{query}\n\n_{answer_tr}:_\n{localized_answer} {str(e)}",
-                                          is_inline=True)
-
-    async def check_allowed_and_within_budget(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                              is_inline=False) -> bool:
-        """
-        Checks if the user is allowed to use the bot and if they are within their budget
-        :param update: Telegram update object
-        :param context: Telegram context object
-        :param is_inline: Boolean flag for inline queries
-        :return: Boolean indicating if the user is allowed to use the bot
-        """
-        name = update.inline_query.from_user.name if is_inline else update.message.from_user.name
-        user_id = update.inline_query.from_user.id if is_inline else update.message.from_user.id
-
-        if not await is_allowed(self.config, update, context, is_inline=is_inline):
-            logging.warning(f'User {name} (id: {user_id}) is not allowed to use the bot')
-            await self.send_disallowed_message(update, context, is_inline)
-            return False
-        if not is_within_budget(self.config, self.usage, update, is_inline=is_inline):
-            logging.warning(f'User {name} (id: {user_id}) reached their usage limit')
-            await self.send_budget_reached_message(update, context, is_inline)
-            return False
-
-        return True
-
-    async def send_disallowed_message(self, update: Update, _: ContextTypes.DEFAULT_TYPE, is_inline=False):
-        """
-        Sends the disallowed message to the user.
-        """
-        if not is_inline:
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                text=self.disallowed_message,
-                disable_web_page_preview=True
-            )
-        else:
-            result_id = str(uuid4())
-            await self.send_inline_query_result(update, result_id, message_content=self.disallowed_message)
-
-    async def send_budget_reached_message(self, update: Update, _: ContextTypes.DEFAULT_TYPE, is_inline=False):
-        """
-        Sends the budget reached message to the user.
-        """
-        if not is_inline:
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                text=self.budget_limit_message
-            )
-        else:
-            result_id = str(uuid4())
-            await self.send_inline_query_result(update, result_id, message_content=self.budget_limit_message)
-
-    async def post_init(self, application: Application) -> None:
-        """
-        Post initialization hook for the bot.
-        """
-        await application.bot.set_my_commands(self.group_commands, scope=BotCommandScopeAllGroupChats())
-        await application.bot.set_my_commands(self.commands)
-
-        # Schedule periodic broadcast job
-        if hasattr(application, "job_queue"):
-            from datetime import datetime, time, timedelta
-            import pytz
-
-            async def periodic_broadcast(context: ContextTypes.DEFAULT_TYPE):
-                from datetime import datetime, time, timedelta
-                import pytz
-
-                # Get the feedback interval from config, default to 7 days if not specified
-                feedback_interval_days = self.config.get('feedback_interval_days', 7)
-                
-                now = datetime.now(pytz.UTC)
-                for user_id, tracker in self.usage.items():
-                    try:
-                        last = tracker.get_last_initiated_message()
-                        if last is not None:
-                            last_dt = datetime.fromisoformat(last)
-                            if (now - last_dt).days < feedback_interval_days:
-                                continue
-                        # Try to send message
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text="Привет! Мы рады снова видеть тебя в чате. Если есть вопросы — пиши!"
-                        )
-                        tracker.set_last_initiated_message(now.date().isoformat())
-                    except Exception as e:
-                        import logging
-                        logging.exception(f"Failed to send scheduled message to {user_id}: {e}")
-
-            # Get broadcast time from config, default to 10:00 UTC if not specified
-            broadcast_hour = self.config.get('broadcast_hour', 10)
-            
-            # Run every day at the configured hour UTC
-            application.job_queue.run_daily(periodic_broadcast, time=time(hour=broadcast_hour, tzinfo=pytz.UTC))
-
-    def run(self):
-        """
-        Runs the bot indefinitely until the user presses Ctrl+C
-        """
-        application = ApplicationBuilder() \
-            .token(self.config['token']) \
-            .proxy_url(self.config['proxy']) \
-            .get_updates_proxy_url(self.config['proxy']) \
-            .post_init(self.post_init) \
-            .concurrent_updates(True) \
-            .build()
-
-        application.add_handler(CommandHandler('reset', self.reset))
-        application.add_handler(CommandHandler('help', self.help))
-        application.add_handler(CommandHandler('image', self.image))
-        application.add_handler(CommandHandler('tts', self.tts))
-        application.add_handler(CommandHandler('start', self.help))
-        application.add_handler(CommandHandler('stats', self.stats))
-        application.add_handler(CommandHandler('resend', self.resend))
-        application.add_handler(CommandHandler(
-            'chat', self.prompt, filters=filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
-        )
-        application.add_handler(MessageHandler(
-            filters.PHOTO | filters.Document.IMAGE,
-            self.vision))
-        application.add_handler(MessageHandler(
-            filters.AUDIO | filters.VOICE | filters.Document.AUDIO |
-            filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO,
-            self.transcribe))
-        application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.prompt))
-        application.add_handler(InlineQueryHandler(self.inline_query, chat_types=[
-            constants.ChatType.GROUP, constants.ChatType.SUPERGROUP, constants.ChatType.PRIVATE
-        ]))
-        application.add_handler(CallbackQueryHandler(self.handle_callback_inline_query))
-
-        application.add_error_handler(error_handler)
-
-        application.run_polling()
+                                                          text=content, markdown=use_markdown
