@@ -4,7 +4,6 @@ import os
 from plugin_manager import PluginManager
 from openai_helper import OpenAIHelper, default_max_tokens, are_functions_available
 from telegram_bot import ChatGPTTelegramBot
-from database import initialize_db_manager
 
 def main():
     # Setup logging
@@ -102,22 +101,6 @@ def main():
     plugin_config = {
         'plugins': os.environ.get('PLUGINS', '').split(',')
     }
-
-    # Database configuration
-    db_config = {
-        'db_host': os.environ.get('DB_HOST', 'localhost'),
-        'db_port': int(os.environ.get('DB_PORT', 5432)),
-        'db_name': os.environ.get('DB_NAME', 'telegram_bot'),
-        'db_user': os.environ.get('DB_USER', 'postgres'),
-        'db_password': os.environ.get('DB_PASSWORD', ''),
-    }
-
-    # Initialize database manager if DB is enabled
-    if os.environ.get('USE_DATABASE', 'false').lower() == 'true':
-        initialize_db_manager(db_config)
-        logging.info("Database connection initialized")
-    else:
-        logging.info("Database usage disabled, using file-based storage")
 
     # Setup and run ChatGPT and Telegram bot
     plugin_manager = PluginManager(config=plugin_config)
