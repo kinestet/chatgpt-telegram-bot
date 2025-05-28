@@ -4,14 +4,14 @@ import asyncio
 import logging
 import os
 import io
-
+from datetime import datetime, timedelta
 from uuid import uuid4
-from telegram import BotCommandScopeAllGroupChats, Update, constants
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton, InlineQueryResultArticle
-from telegram import InputTextMessageContent, BotCommand
+
+from telegram import BotCommandScopeAllGroupChats, Update, constants, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineQueryResultArticle, InputTextMessageContent, BotCommand
 from telegram.error import RetryAfter, TimedOut, BadRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, \
-    filters, InlineQueryHandler, CallbackQueryHandler, Application, ContextTypes, CallbackContext
+    filters, InlineQueryHandler, CallbackQueryHandler, Application, ContextTypes, CallbackContext, JobQueue
 
 from pydub import AudioSegment
 from PIL import Image
@@ -22,6 +22,7 @@ from utils import is_group_chat, get_thread_id, message_text, wrap_with_indicato
     cleanup_intermediate_files
 from openai_helper import OpenAIHelper, localized_text, GPT_ALL_MODELS
 from usage_tracker import UsageTracker
+from db import get_or_create_user, update_user_activity, toggle_auto_messages, set_auto_message_interval, log_action, Chat as ChatModel
 
 
 class ChatGPTTelegramBot:
@@ -43,14 +44,9 @@ class ChatGPTTelegramBot:
             BotCommand(command='reset', description=localized_text('reset_description', bot_language)),
             BotCommand(command='stats', description=localized_text('stats_description', bot_language)),
             BotCommand(command='resend', description=localized_text('resend_description', bot_language)),
-            BotCommand(command='model', description='Change the OpenAI model')
+            BotCommand(command='model', description='Change the OpenAI model'),
+            BotCommand(command='settings', description='Настройки бота')
         ]
-        # If imaging is enabled, add the "image" command to the list
-        if self.config.get('enable_image_generation', False):
-            self.commands.append(BotCommand(command='image', description=localized_text('image_description', bot_language)))
-
-        if self.config.get('enable_tts_generation', False):
-            self.commands.append(BotCommand(command='tts', description=localized_text('tts_description', bot_language)))
 
         self.group_commands = [BotCommand(
             command='chat', description=localized_text('chat_description', bot_language)
@@ -60,6 +56,7 @@ class ChatGPTTelegramBot:
         self.usage = {}
         self.last_message = {}
         self.inline_queries_cache = {}
+        self.job_queue = None
 
     async def help(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         """
@@ -97,11 +94,8 @@ class ChatGPTTelegramBot:
             self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
 
         tokens_today, tokens_month = self.usage[user_id].get_current_token_usage()
-        images_today, images_month = self.usage[user_id].get_current_image_count()
         (transcribe_minutes_today, transcribe_seconds_today, transcribe_minutes_month,
          transcribe_seconds_month) = self.usage[user_id].get_current_transcription_duration()
-        vision_today, vision_month = self.usage[user_id].get_current_vision_tokens()
-        characters_today, characters_month = self.usage[user_id].get_current_tts_usage()
         current_cost = self.usage[user_id].get_current_cost()
 
         chat_id = update.effective_chat.id
@@ -116,50 +110,18 @@ class ChatGPTTelegramBot:
             "----------------------------\n"
         )
         
-        # Check if image generation is enabled and, if so, generate the image statistics for today
-        text_today_images = ""
-        if self.config.get('enable_image_generation', False):
-            text_today_images = f"{images_today} {localized_text('stats_images', bot_language)}\n"
-
-        text_today_vision = ""
-        if self.config.get('enable_vision', False):
-            text_today_vision = f"{vision_today} {localized_text('stats_vision', bot_language)}\n"
-
-        text_today_tts = ""
-        if self.config.get('enable_tts_generation', False):
-            text_today_tts = f"{characters_today} {localized_text('stats_tts', bot_language)}\n"
-        
         text_today = (
             f"*{localized_text('usage_today', bot_language)}:*\n"
             f"{tokens_today} {localized_text('stats_tokens', bot_language)}\n"
-            f"{text_today_images}"  # Include the image statistics for today if applicable
-            f"{text_today_vision}"
-            f"{text_today_tts}"
             f"{transcribe_minutes_today} {localized_text('stats_transcribe', bot_language)[0]} "
             f"{transcribe_seconds_today} {localized_text('stats_transcribe', bot_language)[1]}\n"
             f"{localized_text('stats_total', bot_language)}{current_cost['cost_today']:.2f}\n"
             "----------------------------\n"
         )
         
-        text_month_images = ""
-        if self.config.get('enable_image_generation', False):
-            text_month_images = f"{images_month} {localized_text('stats_images', bot_language)}\n"
-
-        text_month_vision = ""
-        if self.config.get('enable_vision', False):
-            text_month_vision = f"{vision_month} {localized_text('stats_vision', bot_language)}\n"
-
-        text_month_tts = ""
-        if self.config.get('enable_tts_generation', False):
-            text_month_tts = f"{characters_month} {localized_text('stats_tts', bot_language)}\n"
-        
-        # Check if image generation is enabled and, if so, generate the image statistics for the month
         text_month = (
             f"*{localized_text('usage_month', bot_language)}:*\n"
             f"{tokens_month} {localized_text('stats_tokens', bot_language)}\n"
-            f"{text_month_images}"  # Include the image statistics for the month if applicable
-            f"{text_month_vision}"
-            f"{text_month_tts}"
             f"{transcribe_minutes_month} {localized_text('stats_transcribe', bot_language)[0]} "
             f"{transcribe_seconds_month} {localized_text('stats_transcribe', bot_language)[1]}\n"
             f"{localized_text('stats_total', bot_language)}{current_cost['cost_month']:.2f}"
@@ -174,13 +136,6 @@ class ChatGPTTelegramBot:
                 f"{localized_text(budget_period, bot_language)}: "
                 f"${remaining_budget:.2f}.\n"
             )
-        # No longer works as of July 21st 2023, as OpenAI has removed the billing API
-        # add OpenAI account information for admin request
-        # if is_admin(self.config, user_id):
-        #     text_budget += (
-        #         f"{localized_text('stats_openai', bot_language)}"
-        #         f"{self.openai.get_billing_current_month():.2f}"
-        #     )
 
         usage_text = text_current_conversation + text_today + text_month + text_budget
         await update.message.reply_text(usage_text, parse_mode=constants.ParseMode.MARKDOWN)
@@ -287,346 +242,344 @@ class ChatGPTTelegramBot:
             text=f"Model changed to {model_name}. All conversations have been reset."
         )
 
-    async def image(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Generates an image for the given prompt using DALL·E APIs
-        """
-        if not self.config['enable_image_generation'] \
-                or not await self.check_allowed_and_within_budget(update, context):
-            return
-
-        image_query = message_text(update.message)
-        if image_query == '':
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                text=localized_text('image_no_prompt', self.config['bot_language'])
-            )
-            return
-
-        logging.info(f'New image generation request received from user {update.message.from_user.name} '
-                     f'(id: {update.message.from_user.id})')
-
-        async def _generate():
-            try:
-                image_url, image_size = await self.openai.generate_image(prompt=image_query)
-                if self.config['image_receive_mode'] == 'photo':
-                    await update.effective_message.reply_photo(
-                        reply_to_message_id=get_reply_to_message_id(self.config, update),
-                        photo=image_url
-                    )
-                elif self.config['image_receive_mode'] == 'document':
-                    await update.effective_message.reply_document(
-                        reply_to_message_id=get_reply_to_message_id(self.config, update),
-                        document=image_url
-                    )
-                else:
-                    raise Exception(f"env variable IMAGE_RECEIVE_MODE has invalid value {self.config['image_receive_mode']}")
-                # add image request to users usage tracker
-                user_id = update.message.from_user.id
-                self.usage[user_id].add_image_request(image_size, self.config['image_prices'])
-                # add guest chat request to guest usage tracker
-                if str(user_id) not in self.config['allowed_user_ids'].split(',') and 'guests' in self.usage:
-                    self.usage["guests"].add_image_request(image_size, self.config['image_prices'])
-
-            except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=f"{localized_text('image_fail', self.config['bot_language'])}: {str(e)}",
-                    parse_mode=constants.ParseMode.MARKDOWN
-                )
-
-        await wrap_with_indicator(update, context, _generate, constants.ChatAction.UPLOAD_PHOTO)
-
-    async def tts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Generates an speech for the given input using TTS APIs
-        """
-        if not self.config['enable_tts_generation'] \
-                or not await self.check_allowed_and_within_budget(update, context):
-            return
-
-        tts_query = message_text(update.message)
-        if tts_query == '':
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                text=localized_text('tts_no_prompt', self.config['bot_language'])
-            )
-            return
-
-        logging.info(f'New speech generation request received from user {update.message.from_user.name} '
-                     f'(id: {update.message.from_user.id})')
-
-        async def _generate():
-            try:
-                speech_file, text_length = await self.openai.generate_speech(text=tts_query)
-
-                await update.effective_message.reply_voice(
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    voice=speech_file
-                )
-                speech_file.close()
-                # add image request to users usage tracker
-                user_id = update.message.from_user.id
-                self.usage[user_id].add_tts_request(text_length, self.config['tts_model'], self.config['tts_prices'])
-                # add guest chat request to guest usage tracker
-                if str(user_id) not in self.config['allowed_user_ids'].split(',') and 'guests' in self.usage:
-                    self.usage["guests"].add_tts_request(text_length, self.config['tts_model'], self.config['tts_prices'])
-
-            except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=f"{localized_text('tts_fail', self.config['bot_language'])}: {str(e)}",
-                    parse_mode=constants.ParseMode.MARKDOWN
-                )
-
-        await wrap_with_indicator(update, context, _generate, constants.ChatAction.UPLOAD_VOICE)
-
     async def transcribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        Transcribe audio messages.
+        Transcribe voice messages.
         """
-        if not self.config['enable_transcription'] or not await self.check_allowed_and_within_budget(update, context):
+        if not self.config.get('enable_transcription', False):
+            await update.message.reply_text(
+                message_text(update.message.text, 'transcription_disabled'),
+                disable_web_page_preview=True
+            )
             return
 
-        if is_group_chat(update) and self.config['ignore_group_transcriptions']:
-            logging.info('Transcription coming from group chat, ignoring...')
+        if not await is_allowed(self.config, update, context):
+            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+                            'is not allowed to transcribe audio messages')
+            await self.send_disallowed_message(update, context)
             return
 
-        chat_id = update.effective_chat.id
-        filename = update.message.effective_attachment.file_unique_id
-
-        async def _execute():
-            filename_mp3 = f'{filename}.mp3'
-            bot_language = self.config['bot_language']
-            try:
-                media_file = await context.bot.get_file(update.message.effective_attachment.file_id)
-                await media_file.download_to_drive(filename)
-            except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=(
-                        f"{localized_text('media_download_fail', bot_language)[0]}: "
-                        f"{str(e)}. {localized_text('media_download_fail', bot_language)[1]}"
-                    ),
-                    parse_mode=constants.ParseMode.MARKDOWN
-                )
-                return
-
-            try:
-                audio_track = AudioSegment.from_file(filename)
-                audio_track.export(filename_mp3, format="mp3")
-                logging.info(f'New transcribe request received from user {update.message.from_user.name} '
-                             f'(id: {update.message.from_user.id})')
-
-            except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=localized_text('media_type_fail', bot_language)
-                )
-                if os.path.exists(filename):
-                    os.remove(filename)
-                return
-
-            user_id = update.message.from_user.id
-            if user_id not in self.usage:
-                self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
-
-            try:
-                transcript = await self.openai.transcribe(filename_mp3)
-
-                transcription_price = self.config['transcription_price']
-                self.usage[user_id].add_transcription_seconds(audio_track.duration_seconds, transcription_price)
-
-                allowed_user_ids = self.config['allowed_user_ids'].split(',')
-                if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
-                    self.usage["guests"].add_transcription_seconds(audio_track.duration_seconds, transcription_price)
-
-                # check if transcript starts with any of the prefixes
-                response_to_transcription = any(transcript.lower().startswith(prefix.lower()) if prefix else False
-                                                for prefix in self.config['voice_reply_prompts'])
-
-                if self.config['voice_reply_transcript'] and not response_to_transcription:
-
-                    # Split into chunks of 4096 characters (Telegram's message limit)
-                    transcript_output = f"_{localized_text('transcript', bot_language)}:_\n\"{transcript}\""
-                    chunks = split_into_chunks(transcript_output)
-
-                    for index, transcript_chunk in enumerate(chunks):
-                        await update.effective_message.reply_text(
-                            message_thread_id=get_thread_id(update),
-                            reply_to_message_id=get_reply_to_message_id(self.config, update) if index == 0 else None,
-                            text=transcript_chunk,
-                            parse_mode=constants.ParseMode.MARKDOWN
-                        )
-                else:
-                    # Get the response of the transcript
-                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=transcript)
-
-                    self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
-                    if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
-                        self.usage["guests"].add_chat_tokens(total_tokens, self.config['token_price'])
-
-                    # Split into chunks of 4096 characters (Telegram's message limit)
-                    transcript_output = (
-                        f"_{localized_text('transcript', bot_language)}:_\n\"{transcript}\"\n\n"
-                        f"_{localized_text('answer', bot_language)}:_\n{response}"
-                    )
-                    chunks = split_into_chunks(transcript_output)
-
-                    for index, transcript_chunk in enumerate(chunks):
-                        await update.effective_message.reply_text(
-                            message_thread_id=get_thread_id(update),
-                            reply_to_message_id=get_reply_to_message_id(self.config, update) if index == 0 else None,
-                            text=transcript_chunk,
-                            parse_mode=constants.ParseMode.MARKDOWN
-                        )
-
-            except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=f"{localized_text('transcribe_fail', bot_language)}: {str(e)}",
-                    parse_mode=constants.ParseMode.MARKDOWN
-                )
-            finally:
-                if os.path.exists(filename_mp3):
-                    os.remove(filename_mp3)
-                if os.path.exists(filename):
-                    os.remove(filename)
-
-        await wrap_with_indicator(update, context, _execute, constants.ChatAction.TYPING)
-
-    async def vision(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Interpret image using vision model.
-        """
-        if not self.config['enable_vision'] or not await self.check_allowed_and_within_budget(update, context):
+        if is_group_chat(update) and self.config.get('ignore_group_transcriptions', True):
+            logging.info(f'Group chat message, ignoring transcription request')
             return
 
-        chat_id = update.effective_chat.id
-        prompt = update.message.caption
+        logging.info(f'Transcribing voice message by user {update.message.from_user.name} '
+                     f'(id: {update.message.from_user.id})')
 
-        if is_group_chat(update):
-            if self.config['ignore_group_vision']:
-                logging.info('Vision coming from group chat, ignoring...')
-                return
+        voice = await update.message.voice.get_file()
+        voice_ogg = io.BytesIO()
+        await voice.download_to_memory(voice_ogg)
+        voice_ogg.seek(0)
+
+        try:
+            text = await self.openai.transcribe(voice_ogg)
+        except Exception as e:
+            logging.exception(e)
+            await update.message.reply_text(
+                message_text(update.message.text, 'transcription_error'),
+                reply_to_message_id=get_reply_to_message_id(self.config, update)
+            )
+            return
+
+        if text:
+            # Split into chunks of 4096 characters (Telegram's message limit)
+            text_chunks = split_into_chunks(text)
+            for text_chunk in text_chunks:
+                await update.message.reply_text(
+                    text_chunk,
+                    reply_to_message_id=get_reply_to_message_id(self.config, update)
+                )
+        else:
+            await update.message.reply_text(
+                message_text(update.message.text, 'transcription_error'),
+                reply_to_message_id=get_reply_to_message_id(self.config, update)
+            )
+
+    async def settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Показывает меню настроек бота
+        """
+        if not await is_allowed(self.config, update, context):
+            await self.send_disallowed_message(update, context)
+            return
+
+        user = await get_or_create_user(
+            user_id=update.effective_user.id,
+            username=update.effective_user.username,
+            first_name=update.effective_user.first_name,
+            last_name=update.effective_user.last_name,
+            language_code=update.effective_user.language_code
+        )
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "✅ Автосообщения включены" if user.settings.auto_message_enabled else "❌ Автосообщения выключены",
+                    callback_data="toggle_auto_messages"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"⏰ Интервал: {user.settings.auto_message_interval} мин",
+                    callback_data="change_interval"
+                )
+            ]
+        ]
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "Настройки бота:\n\n"
+            "• Автосообщения: бот будет отправлять сообщения, если вы долго не пишете\n"
+            "• Интервал: время ожидания перед отправкой автосообщения",
+            reply_markup=reply_markup
+        )
+
+    async def settings_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Обработчик нажатий на кнопки в меню настроек
+        """
+        query = update.callback_query
+        await query.answer()
+
+        if query.data == "toggle_auto_messages":
+            user = await get_or_create_user(user_id=query.from_user.id)
+            new_state = await toggle_auto_messages(user.id, not user.settings.auto_message_enabled)
+            
+            # Обновляем или удаляем задачу в JobQueue
+            job_name = f"auto_message_{user.id}"
+            if new_state:
+                # Добавляем задачу
+                context.job_queue.run_repeating(
+                    self.send_auto_message,
+                    interval=timedelta(minutes=user.settings.auto_message_interval),
+                    first=timedelta(minutes=user.settings.auto_message_interval),
+                    name=job_name,
+                    data={'user_id': user.id}
+                )
             else:
-                trigger_keyword = self.config['group_trigger_keyword']
-                if (prompt is None and trigger_keyword != '') or \
-                   (prompt is not None and not prompt.lower().startswith(trigger_keyword.lower())):
-                    logging.info('Vision coming from group chat with wrong keyword, ignoring...')
-                    return
-        
-        image = update.message.effective_attachment[-1]
-        
+                # Удаляем задачу
+                current_jobs = context.job_queue.get_jobs_by_name(job_name)
+                for job in current_jobs:
+                    job.schedule_removal()
 
-        async def _execute():
-            bot_language = self.config['bot_language']
+            # Обновляем клавиатуру
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "✅ Автосообщения включены" if new_state else "❌ Автосообщения выключены",
+                        callback_data="toggle_auto_messages"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"⏰ Интервал: {user.settings.auto_message_interval} мин",
+                        callback_data="change_interval"
+                    )
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
+
+        elif query.data == "change_interval":
+            # Здесь можно добавить логику для изменения интервала
+            # Например, показать новое меню с выбором интервала
+            intervals = [15, 30, 60, 120]
+            keyboard = [
+                [InlineKeyboardButton(f"{i} мин", callback_data=f"set_interval_{i}")]
+                for i in intervals
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "Выберите интервал автосообщений:",
+                reply_markup=reply_markup
+            )
+
+        elif query.data.startswith("set_interval_"):
+            interval = int(query.data.split("_")[-1])
+            user = await get_or_create_user(user_id=query.from_user.id)
+            await set_auto_message_interval(user.id, interval)
+            
+            # Обновляем задачу в JobQueue
+            job_name = f"auto_message_{user.id}"
+            current_jobs = context.job_queue.get_jobs_by_name(job_name)
+            for job in current_jobs:
+                job.schedule_removal()
+            
+            if user.settings.auto_message_enabled:
+                context.job_queue.run_repeating(
+                    self.send_auto_message,
+                    interval=timedelta(minutes=interval),
+                    first=timedelta(minutes=interval),
+                    name=job_name,
+                    data={'user_id': user.id}
+                )
+
+            # Возвращаемся к основному меню настроек
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "✅ Автосообщения включены" if user.settings.auto_message_enabled else "❌ Автосообщения выключены",
+                        callback_data="toggle_auto_messages"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"⏰ Интервал: {interval} мин",
+                        callback_data="change_interval"
+                    )
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "Настройки бота:\n\n"
+                "• Автосообщения: бот будет отправлять сообщения, если вы долго не пишете\n"
+                "• Интервал: время ожидания перед отправкой автосообщения",
+                reply_markup=reply_markup
+            )
+
+    async def send_auto_message(self, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Отправляет автосообщение пользователю
+        """
+        job = context.job
+        user_id = job.data['user_id']
+        
+        try:
+            user = await get_or_create_user(user_id=user_id)
+            if not user.settings.auto_message_enabled:
+                return
+
+            # Проверяем, не было ли активности пользователя
+            if datetime.utcnow() - user.last_activity < timedelta(minutes=user.settings.auto_message_interval):
+                return
+
+            # Отправляем сообщение
+            message_text = user.settings.auto_message_text or "Привет! Как твои успехи? Нужна моя помощь?"
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=message_text
+            )
+
+            # Логируем действие
+            await log_action(
+                user_id=user_id,
+                action='auto_message_sent',
+                details={'message': message_text}
+            )
+
+        except Exception as e:
+            logging.error(f"Error sending auto message to user {user_id}: {e}")
+
+    async def prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Обрабатывает текстовые сообщения от пользователя
+        """
+        if not await is_allowed(self.config, update, context):
+            await self.send_disallowed_message(update, context)
+            return
+
+        # Получаем или создаем пользователя
+        user = await get_or_create_user(
+            user_id=update.effective_user.id,
+            username=update.effective_user.username,
+            first_name=update.effective_user.first_name,
+            last_name=update.effective_user.last_name,
+            language_code=update.effective_user.language_code
+        )
+
+        # Обновляем время последней активности
+        await update_user_activity(user.id)
+
+        # Сохраняем сообщение пользователя в базу
+        await ChatModel.create(
+            user=user,
+            message=update.message.text,
+            is_bot=False
+        )
+
+        # Логируем действие
+        await log_action(
+            user_id=user.id,
+            action='message_received',
+            details={'message': update.message.text}
+        )
+
+        # Оригинальная логика обработки сообщения
+        chat_id = update.effective_chat.id
+        self.last_message[chat_id] = update.message.text
+
+        async def _send_message():
             try:
-                media_file = await context.bot.get_file(image.file_id)
-                temp_file = io.BytesIO(await media_file.download_as_bytearray())
-            except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=(
-                        f"{localized_text('media_download_fail', bot_language)[0]}: "
-                        f"{str(e)}. {localized_text('media_download_fail', bot_language)[1]}"
-                    ),
+                response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=update.message.text)
+                
+                # Сохраняем ответ бота в базу
+                await ChatModel.create(
+                    user=user,
+                    message=response,
+                    is_bot=True,
+                    tokens_used=total_tokens
+                )
+
+                # Логируем действие
+                await log_action(
+                    user_id=user.id,
+                    action='message_sent',
+                    details={'message': response, 'tokens': total_tokens}
+                )
+
+                # Отправляем ответ пользователю
+                await update.message.reply_text(
+                    response,
                     parse_mode=constants.ParseMode.MARKDOWN
                 )
-                return
-            
-            # convert jpg from telegram to png as understood by openai
-
-            temp_file_png = io.BytesIO()
-
-            try:
-                original_image = Image.open(temp_file)
-                
-                original_image.save(temp_file_png, format='PNG')
-                logging.info(f'New vision request received from user {update.message.from_user.name} '
-                             f'(id: {update.message.from_user.id})')
 
             except Exception as e:
                 logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=localized_text('media_type_fail', bot_language)
+                await update.message.reply_text(
+                    message_text(update.message.text, 'error'),
+                    parse_mode=constants.ParseMode.MARKDOWN
                 )
-            
-            
 
-            user_id = update.message.from_user.id
-            if user_id not in self.usage:
-                self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
+        await wrap_with_indicator(update, context, _send_message, constants.ChatAction.TYPING)
 
-            if self.config['stream']:
+    def run(self):
+        """
+        Запускает бота
+        """
+        application = ApplicationBuilder() \
+            .token(self.config['token']) \
+            .proxy_url(self.config['proxy']) \
+            .get_updates_proxy_url(self.config['proxy']) \
+            .build()
 
-                stream_response = self.openai.interpret_image_stream(chat_id=chat_id, fileobj=temp_file_png, prompt=prompt)
-                i = 0
-                prev = ''
-                sent_message = None
-                backoff = 0
-                stream_chunk = 0
+        # Сохраняем job_queue для использования в других методах
+        self.job_queue = application.job_queue
 
-                async for content, tokens in stream_response:
-                    if is_direct_result(content):
-                        return await handle_direct_result(self.config, update, content)
+        # Добавляем обработчики команд
+        if len(self.config['admin_user_ids'].split(',')) > 0 and self.config['admin_user_ids'] != '-':
+            application.add_handler(CommandHandler('stats', self.stats, filters=ChatType.PRIVATE))
+            application.add_handler(CommandHandler('allow', self.allow, filters=ChatType.PRIVATE))
+            application.add_handler(CommandHandler('disallow', self.disallow, filters=ChatType.PRIVATE))
+            application.add_handler(CommandHandler('broadcast', self.broadcast, filters=ChatType.PRIVATE))
+            application.add_handler(CommandHandler('block', self.block, filters=ChatType.PRIVATE))
+            application.add_handler(CommandHandler('unblock', self.unblock, filters=ChatType.PRIVATE))
 
-                    if len(content.strip()) == 0:
-                        continue
+        application.add_handler(CommandHandler('start', self.start))
+        application.add_handler(CommandHandler('help', self.help))
+        application.add_handler(CommandHandler('reset', self.reset))
+        application.add_handler(CommandHandler('resend', self.resend))
+        application.add_handler(CommandHandler('model', self.model))
+        application.add_handler(CommandHandler('settings', self.settings))
 
-                    stream_chunks = split_into_chunks(content)
-                    if len(stream_chunks) > 1:
-                        content = stream_chunks[-1]
-                        if stream_chunk != len(stream_chunks) - 1:
-                            stream_chunk += 1
-                            try:
-                                await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                              stream_chunks[-2])
-                            except:
-                                pass
-                            try:
-                                sent_message = await update.effective_message.reply_text(
-                                    message_thread_id=get_thread_id(update),
-                                    text=content if len(content) > 0 else "..."
-                                )
-                            except:
-                                pass
-                            continue
+        # Добавляем обработчик для кнопок настроек
+        application.add_handler(CallbackQueryHandler(self.settings_callback, pattern="^(toggle_auto_messages|change_interval|set_interval_)"))
 
-                    cutoff = get_stream_cutoff_values(update, content)
-                    cutoff += backoff
+        application.add_handler(MessageHandler(filters.VOICE & ~filters.COMMAND, self.transcribe))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.prompt))
+        application.add_handler(InlineQueryHandler(self.inline_query, chat_types=[ChatType.PRIVATE]))
 
-                    if i == 0:
-                        try:
-                            if sent_message is not None:
-                                await context.bot.delete_message(chat_id=sent_message.chat_id,
-                                                                 message_id=sent_message.message_id)
-                            sent_message = await update.effective_message.reply_text(
-                                message_thread_id=get_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                                text=content,
-                            )
-                        except:
-                            continue
+        application.add_error_handler(error_handler)
 
-                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
-                        prev = content
+        # Запускаем бота
+        application.run_polling()
 
-                        try:
-                            use_markdown = tokens != 'not_finished'
-                            await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                          text=content, markdown=use_markdown
