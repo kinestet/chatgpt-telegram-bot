@@ -60,6 +60,8 @@ class UsageTracker:
                 self.usage['usage_history']['vision_tokens'] = {}
             if 'tts_characters' not in self.usage['usage_history']:
                 self.usage['usage_history']['tts_characters'] = {}
+            if 'last_initiated_message' not in self.usage:
+                self.usage['last_initiated_message'] = None
         else:
             # ensure directory exists
             pathlib.Path(logs_dir).mkdir(exist_ok=True)
@@ -67,10 +69,26 @@ class UsageTracker:
             self.usage = {
                 "user_name": user_name,
                 "current_cost": {"day": 0.0, "month": 0.0, "all_time": 0.0, "last_update": str(date.today())},
-                "usage_history": {"chat_tokens": {}, "transcription_seconds": {}, "number_images": {}, "tts_characters": {}, "vision_tokens":{}}
+                "usage_history": {"chat_tokens": {}, "transcription_seconds": {}, "number_images": {}, "tts_characters": {}, "vision_tokens":{}},
+                "last_initiated_message": None
             }
 
     # token usage functions:
+
+    def get_last_initiated_message(self):
+        """
+        Returns the date string of the last initiated message, or None if never sent.
+        """
+        return self.usage.get("last_initiated_message", None)
+
+    def set_last_initiated_message(self, date_str):
+        """
+        Sets the date string of the last initiated message and saves to file.
+        """
+        self.usage["last_initiated_message"] = date_str
+        with open(self.user_file, "w") as outfile:
+            json.dump(self.usage, outfile)
+
 
     def add_chat_tokens(self, tokens, tokens_price=0.002):
         """Adds used tokens from a request to a users usage history and updates current cost

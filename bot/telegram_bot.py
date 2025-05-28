@@ -1043,6 +1043,36 @@ class ChatGPTTelegramBot:
         await application.bot.set_my_commands(self.group_commands, scope=BotCommandScopeAllGroupChats())
         await application.bot.set_my_commands(self.commands)
 
+        # Schedule periodic broadcast job
+        if hasattr(application, "job_queue"):
+            from datetime import datetime, timedelta
+            import pytz
+
+            async def periodic_broadcast(context: ContextTypes.DEFAULT_TYPE):
+                from datetime import datetime, timedelta
+                import pytz
+
+                now = datetime.now(pytz.UTC)
+                for user_id, tracker in self.usage.items():
+                    try:
+                        last = tracker.get_last_initiated_message()
+                        if last is not None:
+                            last_dt = datetime.fromisoformat(last)
+                            if (now - last_dt).days < 7:
+                                continue
+                        # Try to send message
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text="Привет! Мы рады снова видеть тебя в чате. Если есть вопросы — пиши!"
+                        )
+                        tracker.set_last_initiated_message(now.date().isoformat())
+                    except Exception as e:
+                        import logging
+                        logging.exception(f"Failed to send scheduled message to {user_id}: {e}")
+
+            # Run every day at 10:00 UTC
+            application.job_queue.run_daily(periodic_broadcast, time=datetime.time(hour=10, tzinfo=pytz.UTC))
+
     def run(self):
         """
         Runs the bot indefinitely until the user presses Ctrl+C
